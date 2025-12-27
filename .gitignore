@@ -4,4 +4,11 @@
 !.gitignore
 !ap2-receiver.py
 !README.md
+!INSTALL.md
 !requirements.txt
+!get-network-guid.ps1
+!run-receiver.ps1
+!config.json
+# Include source code directories
+!ap2/
+!ap2/**
