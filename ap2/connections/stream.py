@@ -77,6 +77,11 @@ class Stream:
                 isDebug=self.isDebug,
             )
 
+        # Multi-room sync timing
+        self.anchorRTPTimestamp = None
+        self.anchorMonotonicNanosLocal = None
+        self.sample_delay = None  # Will be set after audio connection initializes
+
         if self.streamtype == Stream.REALTIME or self.streamtype == Stream.BUFFERED:
             self.control_proc, self.control_conns = Control.spawn(
                 controladdr_ours=self.control_socket,
@@ -99,8 +104,10 @@ class Stream:
             self.latency_max = stream["latencyMax"]
             """ Define a small buffer size - enough to keep playback stable
             (11025//352) ≈ 0.25 seconds. Not 'realtime', but prevents jitter well.
+            Windows fix: Use multiplier of 3-4 for good multi-room sync (was 7 originally, 20 was too high)
             """
-            buffer = ((self.latency_min * 7) // self.spf) + 1
+            buffer_multiplier = 4  # Balance between jitter tolerance and sync latency
+            buffer = ((self.latency_min * buffer_multiplier) // self.spf) + 1
             self.data_proc, self.audio_connection = AudioRealtime.spawn(
                 self.data_socket,
                 self.session_key, self.session_iv,
@@ -111,6 +118,7 @@ class Stream:
                 isDebug=self.isDebug,
                 aud_params=None,
             )
+            # Audio process will send sample_delay when play() starts - don't poll yet
             self.descriptor = {
                 'type': self.streamtype,
                 'controlPort': self.getControlPort(),
@@ -118,6 +126,7 @@ class Stream:
                 'audioBufferSize': self.buff_size,
                 'streamID': self.streamID,
             }
+            # audioLatency will be added dynamically in getDescriptor() once available
             if self.has_scs:
                 self.descriptor['streamConnections'] = self.streamConnections.getSCs()
 
@@ -134,6 +143,7 @@ class Stream:
                 isDebug=self.isDebug,
                 aud_params=None,
             )
+            # Audio process will send sample_delay when play() starts - don't poll yet
             self.descriptor = {
                 'type': self.streamtype,
                 'controlPort': self.getControlPort(),
@@ -142,6 +152,7 @@ class Stream:
                 'audioBufferSize': self.buff_size,
                 'streamID': self.streamID,
             }
+            # audioLatency will be added dynamically in getDescriptor() once available
             if self.has_scs:
                 self.descriptor['streamConnections'] = self.streamConnections.getSCs()
 
@@ -182,8 +193,64 @@ class Stream:
             msg += f'dataPort={self.getDataPort()} '
         return msg
 
+    def _poll_sample_delay(self, timeout=2.0):
+        """Poll audio process for sample_delay value - called when needed"""
+        import time
+        start = time.time()
+        while time.time() - start < timeout:
+            if self.audio_connection.poll(0.05):
+                msg = self.audio_connection.recv()
+                if isinstance(msg, str):
+                    if msg.startswith("sample_delay-"):
+                        self.sample_delay = float(msg.split("-")[1])
+                        print(f"[Stream {self.streamID}] Received sample_delay: {self.sample_delay:.5f}sec")
+                        return True
+                    elif msg.startswith("anchor-"):
+                        # Store anchor if we get it while polling for sample_delay
+                        parts = msg.split("-")
+                        self.anchorRTPTimestamp = int(parts[1])
+                        self.anchorMonotonicNanosLocal = int(parts[2])
+                        # Continue polling for sample_delay
+        # Didn't receive it in time
+        return False
+
+    def updateAnchorFromAudio(self):
+        """Poll for anchor timing from audio subprocess after FLUSH"""
+        import time
+        # Audio process sends anchor timing immediately after FLUSH
+        timeout = 0.5  # Should arrive very quickly
+        start = time.time()
+        while time.time() - start < timeout:
+            if self.audio_connection.poll(0.01):
+                msg = self.audio_connection.recv()
+                if isinstance(msg, str):
+                    if msg.startswith("anchor-"):
+                        parts = msg.split("-")
+                        self.anchorRTPTimestamp = int(parts[1])
+                        self.anchorMonotonicNanosLocal = int(parts[2])
+                        print(f"[Stream {self.streamID}] Received anchor from audio: RTP={self.anchorRTPTimestamp}")
+                        return True
+                    elif msg.startswith("sample_delay-"):
+                        # Store if we haven't gotten it yet
+                        if self.sample_delay is None:
+                            self.sample_delay = float(msg.split("-")[1])
+        return False
+
     def getDescriptor(self):
-        return self.descriptor
+        # Create a copy of descriptor to add dynamic timing info
+        desc = self.descriptor.copy()
+
+        # Add actual audioLatency (no inflation - we lie via RTP timestamp instead)
+        if self.sample_delay is not None:
+            desc['audioLatency'] = int(self.sample_delay * 1000000)
+            print(f"[Stream {self.streamID}] Reporting audioLatency: {self.sample_delay:.3f}sec")
+
+        # Add anchor RTP timestamp for multi-room sync
+        # Note: anchor RTP may be offset to trick iOS about our position
+        if self.anchorRTPTimestamp is not None:
+            desc['rtpTime'] = self.anchorRTPTimestamp
+
+        return desc
 
     def isCulled(self):
         return self.culled

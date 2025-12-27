@@ -197,14 +197,22 @@ def set_volume_pid(pid):
 def get_pycaw_volume_session():
     if platform.system() != 'Windows' or AudioUtilities is None:
         return
+    print(f"[VOLUME] Looking for audio PID: {audio_pid}")
     session = None
+    found_sessions = []
     for s in AudioUtilities.GetAllSessions():
         try:
-            if s.Process.pid == audio_pid:
+            pid = s.Process.pid if s.Process else None
+            name = s.Process.name() if s.Process else "Unknown"
+            found_sessions.append(f"{name}({pid})")
+            if pid == audio_pid:
                 session = s._ctl.QueryInterface(ISimpleAudioVolume)
+                print(f"[VOLUME] Found matching session: {name}({pid})")
                 break
         except AttributeError:
             pass
+    if not session:
+        print(f"[VOLUME] Available sessions: {', '.join(found_sessions)}")
     return session
 
 
@@ -260,4 +268,7 @@ def set_volume(vol):
         volume_session = get_pycaw_volume_session()
         if volume_session:
             pct = interpolate(vol, -30, 0, 0, 1)
+            print(f"[VOLUME] Setting Windows volume to {pct:.3f} (from AirPlay {vol:.1f}dB)")
             volume_session.SetMasterVolume(pct, None)
+        else:
+            print(f"[VOLUME] ERROR: Could not find audio session for PID {audio_pid}")

@@ -4,6 +4,8 @@ import multiprocessing
 import random
 import tempfile  # noqa
 from threading import current_thread
+import json
+import os
 
 import pprint
 
@@ -525,7 +527,7 @@ class AP2Handler(http.server.BaseHTTPRequestHandler):
                 stream_id=increase_stream_id(),
                 shared_key=self.ecdh_shared_key,
                 isDebug=DEBUG,
-                aud_params=self.aud_params
+                aud_params=self.aud_params,
             )
 
             self.server.streams.append(streamobj)
@@ -612,9 +614,9 @@ class AP2Handler(http.server.BaseHTTPRequestHandler):
                         self.logger.debug(s.getSummaryMessage())
 
                         if s.getStreamType() == Stream.BUFFERED:
-                            set_volume_pid(s.getControlProc().pid)
+                            set_volume_pid(s.getDataProc().pid)
                         if s.getStreamType() == Stream.REALTIME:
-                            set_volume_pid(s.getControlProc().pid)
+                            set_volume_pid(s.getDataProc().pid)
 
                     self.logger.debug(self.pp.pformat(stream_setup_data))
                     res = writePlistToString(stream_setup_data)
@@ -859,6 +861,8 @@ class AP2Handler(http.server.BaseHTTPRequestHandler):
             try:
                 for s in self.server.streams:
                     s.getAudioConnection().send(f"flush_seq_rtptime-{seq}-{rtptime}")
+                    # Get actual anchor timing from audio subprocess for multi-room sync feedback
+                    s.updateAnchorFromAudio()
             except OSError as e:
                 self.logger.error(f'FLUSH error: {repr(e)}')
 
@@ -929,7 +933,15 @@ class AP2Handler(http.server.BaseHTTPRequestHandler):
                     stream_data['streams'].append(s.getDescriptor())
             else:
                 stream_data = {}
-            # self.logger.debug(stream_data)
+            # Log with timing info if present
+            if stream_data.get('streams') and len(stream_data['streams']) > 0:
+                s = stream_data['streams'][0]
+                if 'rtpTime' in s:
+                    self.logger.info(f"[FEEDBACK] Sending with anchor RTP: {s['rtpTime']}")
+                else:
+                    self.logger.info(f"[FEEDBACK] Sending WITHOUT anchor timing")
+            else:
+                self.logger.info(f"[FEEDBACK] Sending: {stream_data}")
             res = writePlistToString(stream_data)
             self.send_header("Content-Length", len(res))
             self.send_header("Content-Type", HTTP_CT_BPLIST)
@@ -1340,6 +1352,21 @@ if __name__ == "__main__":
     parser.add_argument("--debug", help="Prints extra debug message e.g. HTTP headers.", action='store_true')
 
     args = parser.parse_args()
+
+    # Load config.json if it exists
+    config_path = os.path.join(os.path.dirname(__file__), 'config.json')
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+                if 'device_name' in config:
+                    # Override mdns arg with config value
+                    args.mdns = config['device_name']
+                    print(f"[Config] Device name: {args.mdns}")
+        except Exception as e:
+            print(f"[Config] Warning: Could not load config.json: {e}")
+    else:
+        print(f"[Config] No config.json found, using defaults")
 
     DEBUG = args.debug
     if DEBUG:

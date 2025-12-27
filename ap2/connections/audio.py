@@ -448,6 +448,7 @@ class Audio:
         """ variables we get via RTCP from Control class """
         self.senderRtpTimestamp, self.playAtRtpTimestamp = None, None
         self.remoteClockMonotonic_ts, self.remoteClockId = None, None
+        self.diag_packet_count = 0  # Diagnostic counter
 
     def init_audio_sink(self):
         codecLatencySec = 0
@@ -456,7 +457,7 @@ class Audio:
                                  channels=self.channel_count,
                                  rate=self.sample_rate,
                                  output=True,
-                                 frames_per_buffer=4,
+                                 frames_per_buffer=512,  # Balanced for quality and sync (was 4, tried 1024)
                                  )
         # nice Python3 crash if we don't check self.sink is null. Not harmful, but should check.
         if not self.sink:
@@ -500,7 +501,19 @@ class Audio:
         if self.codec is not None:
             self.codecContext = av.codec.CodecContext.create(self.codec)
             self.codecContext.sample_rate = self.sample_rate
-            self.codecContext.channels = self.channel_count
+            # Fix for PyAV >= 10.0.0: channels is read-only, use layout instead
+            try:
+                # Try legacy API first (PyAV < 10.0.0)
+                self.codecContext.channels = self.channel_count
+            except AttributeError:
+                # PyAV >= 10.0.0: use layout attribute
+                if self.channel_count == 1:
+                    self.codecContext.layout = 'mono'
+                elif self.channel_count == 2:
+                    self.codecContext.layout = 'stereo'
+                else:
+                    # Fallback for other channel counts
+                    self.codecContext.layout = f'{self.channel_count}c'
             self.codecContext.format = av.AudioFormat('s' + str(self.sample_size) + 'p')
         if ed is not None:
             self.codecContext.extradata = ed
@@ -518,7 +531,9 @@ class Audio:
         pyAudioDelay = self.sink.get_output_latency()
         self.audio_screen_logger.debug(f"pyAudioDelay (sec): {pyAudioDelay:0.5f}")
         ptpDelay = 0.002
-        self.sample_delay = pyAudioDelay + audioDevicelatency + codecLatencySec + ptpDelay
+        # Store device output latency separately for sync calculations
+        self.device_output_latency = pyAudioDelay + audioDevicelatency + codecLatencySec + ptpDelay
+        self.sample_delay = self.device_output_latency
         self.audio_screen_logger.info(f"Total sample_delay (sec): {self.sample_delay:0.5f}")
 
     def decrypt(self, rtp):
@@ -567,12 +582,43 @@ class Audio:
         packet = av.packet.Packet(data)
         if(len(data) > 0):
             try:
+                self.diag_packet_count += 1
+                log_diag = self.diag_packet_count <= 5  # Log first 5 packets
+
+                # Accumulate all decoded frames (decode can return multiple frames per packet)
+                audio_data = b''
+                decode_count = 0
                 for frame in self.codecContext.decode(packet):
-                    frame = self.resampler.resample(frame)
-                    if isinstance(frame, list):
-                        if len(frame) == 1: # if no resampling was needed, resample returns [frame]
-                            frame = frame[0]
-                    return bytes(frame.planes[0])
+                    decode_count += 1
+                    if log_diag:
+                        self.audio_screen_logger.info(f"[DIAG PKT{self.diag_packet_count}] Decoded frame {decode_count}: samples={frame.samples}, format={frame.format}, layout={frame.layout}, planes={len(frame.planes)}")
+
+                    resampled = self.resampler.resample(frame)
+                    # PyAV 16 resample() returns a list of frames
+                    if isinstance(resampled, list):
+                        if log_diag:
+                            self.audio_screen_logger.info(f"[DIAG PKT{self.diag_packet_count}] Resampler returned list with {len(resampled)} frames")
+                        for resampled_frame in resampled:
+                            # Calculate actual audio bytes (plane buffer may be padded)
+                            bytes_per_sample = resampled_frame.format.bytes * len(resampled_frame.layout.channels)
+                            valid_bytes = resampled_frame.samples * bytes_per_sample
+                            plane_bytes = bytes(resampled_frame.planes[0])
+
+                            if log_diag:
+                                self.audio_screen_logger.info(f"[DIAG PKT{self.diag_packet_count}] Resampled frame: samples={resampled_frame.samples}, format={resampled_frame.format}, planes={len(resampled_frame.planes)}, plane_bytes={len(plane_bytes)}, valid_bytes={valid_bytes}")
+
+                            # Extract only valid audio data, discard padding
+                            audio_data += plane_bytes[:valid_bytes]
+                    else:
+                        # Older PyAV versions may return a single frame
+                        bytes_per_sample = resampled.format.bytes * len(resampled.layout.channels)
+                        valid_bytes = resampled.samples * bytes_per_sample
+                        plane_bytes = bytes(resampled.planes[0])
+                        audio_data += plane_bytes[:valid_bytes]
+
+                if log_diag:
+                    self.audio_screen_logger.info(f"[DIAG PKT{self.diag_packet_count}] Total decoded frames: {decode_count}, total audio bytes: {len(audio_data)}")
+                return audio_data if audio_data else None
             except ValueError as e:
                 self.audio_screen_logger.error(repr(e))
                 pass  # noqa
@@ -603,6 +649,10 @@ class Audio:
 
     def msec_to_playout_with_outdev_delay(self, rtp_ts):
         return int(self.msec_to_playout(rtp_ts) - ((self.sample_delay * 1e3)))
+
+    def msec_to_playout_for_sync(self, rtp_ts):
+        """Calculate delay for multi-room sync using only device output latency"""
+        return int(self.msec_to_playout(rtp_ts) - ((self.device_output_latency * 1e3)))
 
     def samples_elapsed_since_anchor(self):
         realtime_offset_sec = (time.monotonic_ns() - self.anchorMonotonicNanosLocal) * 1e-9
@@ -643,6 +693,12 @@ class AudioRealtime(Audio):
     """
     Realtime needs at least a few packets in the buffer to handle jitter.
     """
+    # Multi-room sync configuration
+    # Drift threshold in milliseconds - only adjust timing if drift exceeds this value
+    # Lower values (10-20ms) provide tighter sync but may cause more adjustments
+    # Higher values (50-100ms) are more tolerant but may have noticeable sync drift
+    SYNC_DRIFT_THRESHOLD_MS = 20
+
     def __init__(
             self,
             addr,
@@ -652,7 +708,7 @@ class AudioRealtime(Audio):
             streamtype,
             control_conns=None,
             isDebug=False,
-            aud_params: AudioSetup = None
+            aud_params: AudioSetup = None,
     ):
         super(AudioRealtime, self).__init__(
             addr,
@@ -662,13 +718,27 @@ class AudioRealtime(Audio):
             streamtype,
             control_conns,
             isDebug,
-            aud_params
+            aud_params,
         )
         self.isDebug = isDebug
         self.socket = get_free_socket() if not addr else addr
         self.port = self.socket.getsockname()[1]
         self.rtp_buffer = RTPRealtimeBuffer(buff_size, self.isDebug)
         self.anchorRTPTimestamp = None
+        # Calculate RTP buffer fill latency for multi-room sync
+        # buff_size is in packets, spf is samples per frame, sample_rate is Hz
+        self.buffer_latency = (buff_size * spf) / self.sample_rate
+        print(f'[SYNC DEBUG] buffer_size={buff_size} pkts, spf={spf}, sample_rate={self.sample_rate}Hz, buffer_latency={self.buffer_latency:.3f}sec')
+
+    def init_audio_sink(self):
+        """Override - add buffer latency to sample_delay for multi-room sync"""
+        super().init_audio_sink()
+        # Add buffer latency to get total delay from packet arrival to speaker output
+        device_latency = self.sample_delay
+        self.sample_delay = device_latency + self.buffer_latency
+        self.audio_screen_logger.info(f"[SYNC] Device output latency: {device_latency:0.5f}sec")
+        self.audio_screen_logger.info(f"[SYNC] RTP buffer latency: {self.buffer_latency:0.5f}sec")
+        self.audio_screen_logger.info(f"[SYNC] Total sample_delay: {self.sample_delay:0.5f}sec")
 
     def fini_audio_sink(self):
         self.sink.close()
@@ -713,6 +783,8 @@ class AudioRealtime(Audio):
 
     def play(self, rtspconn, serverconn):
         self.init_audio_sink()
+        # Send sample_delay back to main process for multi-room sync
+        rtspconn.send(f"sample_delay-{self.sample_delay}")
         RTP_SEQ_SIZE = 2**16
         RTP_ROLLOVER = RTP_SEQ_SIZE - 1  # 65535
         lastRecvdSeqNo = 0
@@ -731,6 +803,15 @@ class AudioRealtime(Audio):
                     if str.startswith(message, "flush_seq_rtptime"):
                         flush_seq, self.anchorRTPTimestamp = map(int, str.split(message, "-")[-2:])
                         self.rtp_buffer.flush(flush_seq)
+
+                        # Report accurate timing for multi-room sync
+                        delay_nanos = int(self.sample_delay * 1e9)
+                        self.anchorMonotonicNanosLocal = time.monotonic_ns() + delay_nanos
+
+                        self.audio_screen_logger.info(f"[SYNC] FLUSH: Anchor {self.anchorRTPTimestamp} will play in {self.sample_delay:.3f}s")
+
+                        rtspconn.send(f"anchor-{self.anchorRTPTimestamp}-{self.anchorMonotonicNanosLocal}")
+
                         starting = True
                         playing = False
                     elif str.startswith(message, "progress"):
@@ -747,16 +828,19 @@ class AudioRealtime(Audio):
                     self.rtp_buffer.is_full()  # or amount() > 0.x
                 ):
                     try:
+                        if starting:
+                            self.audio_screen_logger.info(f"[SYNC] Starting playback")
+                            starting = False
+
+                        # Pop and play
                         if playing:
                             rtp = self.rtp_buffer.pop((lastPlayedSeqNo + 1) % RTP_SEQ_SIZE)
                         else:
                             rtp = self.rtp_buffer.pop(0)
-                            if starting:
-                                self.anchorMonotonicNanosLocal = time.monotonic_ns()
-                                starting = False
 
                         if rtp:
                             if p_write_a:
+                                # Use base timing without adjustment - iOS already knows our latency
                                 delay = self.msec_to_playout(rtp.timestamp) - p_write_a
                                 """
                                 if p_write > one_pkt:
@@ -769,8 +853,8 @@ class AudioRealtime(Audio):
                                     dont skip frames and the playout lags behind. This is an unbuffered approach. WiFi also affects. """
                                     continue
                                 '''  # comment this out to enable relative sync
-                                if delay - 2 > 3:
-                                    time.sleep((delay - 2) * 1e-3)
+                                # Multi-room sync: No sleep - iOS coordinates based on reported latency
+                                # PyAudio buffer handles local timing, iOS handles multi-room sync
 
                                 if rtp.sequence_no % 20 == 0:
                                     print(f'playout offset: {delay:+3.2} msec (relative to self)     ', end='\r', flush=False)
@@ -811,7 +895,7 @@ class AudioBuffered(Audio):
             streamtype=0,
             control_conns=None,
             isDebug=False,
-            aud_params: AudioSetup = None
+            aud_params: AudioSetup = None,
     ):
         super(AudioBuffered, self).__init__(
             addr,
@@ -868,6 +952,9 @@ class AudioBuffered(Audio):
                     self.audio_screen_logger.info(f"playback: forwarding to timestamp {ts}")
                     self.rtp_buffer.flush(ts)
                     synced = True
+                elif isinstance(message, str) and message.startswith("sample_delay-"):
+                    # Forward sample_delay from serve thread to main process
+                    rtspconn.send(message)
 
             if rtspconn.poll(rtsp_cmd_receiver_timeout):
                 try:
@@ -876,6 +963,8 @@ class AudioBuffered(Audio):
                         if str.startswith(message, "play"):
                             self.anchorMonotonicNanosLocal = time.monotonic_ns()
                             self.anchorRTPTimestamp = int(str.split(message, "-")[1])
+                            # Send anchor timing back to main process for feedback responses
+                            rtspconn.send(f"anchor-{self.anchorRTPTimestamp}-{self.anchorMonotonicNanosLocal}")
                             playing = True
 
                         elif message == "pause":
@@ -926,6 +1015,8 @@ class AudioBuffered(Audio):
     # server fills the buffer, and admits packets within desired timestamp ranges.
     def serve(self, playerconn, control_recv, control_send):
         self.init_audio_sink()
+        # Send sample_delay back to main process for multi-room sync
+        playerconn.send(f"sample_delay-{self.sample_delay}")
 
         conn, addr = self.socket.accept()
         flush_until = None
