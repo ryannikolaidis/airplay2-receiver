@@ -21,3 +21,4 @@
 *-output.txt
 setup-log.txt
 airplay2-env-check.txt
+*.pyc
