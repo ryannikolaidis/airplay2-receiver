@@ -14,6 +14,342 @@ Attempted to implement configurable multi-room audio synchronization delay to al
 
 ---
 
+## Environment and Setup
+
+### Project Base
+
+**Repository:** [openairplay/airplay2-receiver](https://github.com/openairplay/airplay2-receiver)
+- Python-based AirPlay 2 audio receiver
+- Implements HomeKit Accessory Protocol (HAP) pairing
+- Supports FairPlay v3 authentication and decryption
+- Handles both buffered and realtime audio streams
+- Cross-platform (Linux, macOS, Windows)
+
+**Our Fork:** [ryannikolaidis/airplay2-receiver](https://github.com/ryannikolaidis/airplay2-receiver)
+- Windows-specific improvements
+- Volume control via IAudioSessionControl2
+- PyAV 10.0.0 compatibility fixes
+- Configuration file support
+- Setup and diagnostic scripts
+
+### Windows Environment
+
+**Operating System:**
+- Windows 10/11 (x64)
+- Network-attached storage: `/Volumes/10.0.0.22/airplay2-server/`
+- IP Address: 10.0.0.22
+- Network Interface: Ethernet (70-85-C2-46-3B-A4)
+
+**Python Stack:**
+```
+Python:         3.11.9 (upgraded from 3.7.7)
+pip:            24.x
+Package Manager: pipwin (for PyAudio pre-compiled wheels)
+```
+
+**Core Dependencies:**
+```
+av (PyAV)          11.x    - FFmpeg Python bindings for ALAC decoding
+pyaudio            0.2.14  - Audio playback via PortAudio/WASAPI
+cryptography       43.x    - AES-CTR encryption/decryption
+pycryptodomex      3.20.x  - FairPlay crypto operations
+srptools           1.0.x   - Secure Remote Password auth
+zeroconf           0.x     - mDNS/Bonjour service broadcasting
+netifaces          0.11.x  - Network interface enumeration
+biplist            1.0.x   - Binary plist parsing
+```
+
+**System Dependencies:**
+```
+FFmpeg:                     6.x (via Chocolatey)
+Visual Studio Build Tools:  2022 (for native extension compilation)
+PortAudio:                  (bundled with PyAudio wheel)
+```
+
+### Hardware Setup
+
+**Windows PC (Receiver):**
+- CPU: x64 processor
+- RAM: 4GB minimum (8GB recommended)
+- Audio: Windows WASAPI output
+- Network: 1 Gbps Ethernet connection
+- Firewall: Allowed Python on port 7000 (TCP), UDP ports for RTP
+
+**Test Devices:**
+- **iOS Controller:** iPhone running iOS 17
+- **Comparison Device:** Sonos speaker (AirPlay 2 native support)
+- **Network:** All devices on same Wi-Fi/Ethernet LAN (subnet 10.0.0.x)
+- **Router:** Consumer-grade (no PTP support)
+
+### Network Configuration
+
+```
+Topology:
+  iOS Device (Wi-Fi)
+       |
+       |-- Router (10.0.0.1)
+       |      |
+       |      |-- Windows PC (10.0.0.22, Ethernet)
+       |      |-- Sonos Speaker (Wi-Fi)
+       |
+  [No PTP, No Hardware Sync]
+```
+
+**Network Characteristics:**
+- Latency: ~20ms between devices
+- Bandwidth: > 100 Mbps available
+- Jitter: Typical consumer Wi-Fi variability
+- mDNS: Working (Bonjour service broadcasting)
+- Multicast: Functional (required for mDNS discovery)
+
+### Codebase Structure
+
+```
+airplay2-receiver/
+├── ap2-receiver.py              # Main entry point, RTSP server
+│   - Handles HTTP/RTSP requests
+│   - Manages HAP pairing state
+│   - Coordinates stream setup
+│   - Loads config.json
+│
+├── ap2/
+│   ├── connections/
+│   │   ├── audio.py             # ★ Audio processing (our focus)
+│   │   │   - RTP packet decryption
+│   │   │   - ALAC decoding via PyAV
+│   │   │   - Buffer management
+│   │   │   - PyAudio output
+│   │   │   - FLUSH/anchor timing ← SYNC ISSUE HERE
+│   │   │
+│   │   ├── stream.py            # Stream coordination
+│   │   │   - Manages audio/control channels
+│   │   │   - Reports audioLatency
+│   │   │   - Provides descriptor for SETUP response
+│   │   │
+│   │   ├── control.py           # RTP control channel
+│   │   │   - Handles timing packets
+│   │   │   - Manages retransmit requests
+│   │   │
+│   │   └── event.py             # Event channel
+│   │       - Volume change notifications
+│   │       - Playback state updates
+│   │
+│   ├── pairing/
+│   │   ├── hap.py              # HomeKit pairing
+│   │   │   - SRP authentication
+│   │   │   - Ed25519 key exchange
+│   │   │   - Encrypted session setup
+│   │   │
+│   │   └── srp.py              # Secure Remote Password
+│   │
+│   ├── playfair.py             # FairPlay v3 handling
+│   │   - Decrypts FairPlay encrypted streams
+│   │   - Handles MFi authentication (if available)
+│   │
+│   ├── utils.py                # Utility functions
+│   │   - Volume control (Windows COM)
+│   │   - Network socket helpers
+│   │
+│   └── sdphandler.py           # SDP parser
+│       - Parses RTSP SDP bodies
+│       - Extracts audio format, encryption keys
+│
+├── config.json                  # Runtime configuration
+│   {
+│     "device_name": "Upstairs"
+│   }
+│
+└── requirements.txt             # Python dependencies
+```
+
+### Audio Pipeline
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     AirPlay 2 Audio Flow                        │
+└─────────────────────────────────────────────────────────────────┘
+
+iOS Device
+    │
+    │ [RTP/UDP Encrypted Audio]
+    ↓
+Windows Receiver (ap2-receiver.py)
+    │
+    ├─→ RTSP Server (port 7000)
+    │   └─→ SETUP, RECORD, FLUSH, TEARDOWN commands
+    │
+    ├─→ RTP Data Channel (UDP dynamic port)
+    │   └─→ Encrypted ALAC audio packets
+    │       │
+    │       ↓
+    │   RTPRealtimeBuffer (audio.py)
+    │   - Circular buffer (8192 packets default)
+    │   - Handles packet reordering
+    │   - Detects missing packets
+    │       │
+    │       ↓
+    │   AES-CTR Decryption
+    │   - Session key from SETUP
+    │   - Per-packet IV
+    │       │
+    │       ↓
+    │   PyAV ALAC Decoder (av.codec)
+    │   - Decodes Apple Lossless
+    │   - Outputs PCM frames
+    │       │
+    │       ↓
+    │   PyAV Resampler (if needed)
+    │   - Converts sample rate
+    │   - Adjusts channel layout
+    │       │
+    │       ↓
+    │   PyAudio Stream
+    │   - WASAPI output
+    │   - 512 frame buffer
+    │       │
+    │       ↓
+    Windows Audio Subsystem
+    │   - Audio device buffer (~90ms)
+    │   - Hardware output latency (~90ms)
+    │
+    ↓
+🔊 Speakers
+
+Total Latency: ~1.19 seconds
+  - RTP buffer:      ~1.0s  (8192 packets @ 44.1kHz)
+  - PyAudio buffer:  ~0.09s (512 frames)
+  - Device output:   ~0.09s (hardware/driver)
+  - Codec latency:   ~0.01s (negligible)
+```
+
+### Multi-Room Coordination Protocol
+
+**How iOS Coordinates Multiple Receivers:**
+
+1. **Discovery Phase** (mDNS)
+   ```
+   iOS → Multicast DNS → Discovers: "Windows AirPlay", "Sonos"
+   Checks features bitmask for multi-room capability
+   ```
+
+2. **Pairing Phase** (HAP)
+   ```
+   iOS ←→ Each Receiver: SRP authentication
+   Establishes encrypted session keys
+   ```
+
+3. **Setup Phase** (RTSP)
+   ```
+   iOS → SETUP request → Receivers
+   iOS ← Feedback with audioLatency ← Receivers
+
+   Example feedback:
+   {
+     "audioLatency": 1190000,  // 1.19 seconds in microseconds
+     "type": 96,               // Realtime
+     "streams": [...]
+   }
+   ```
+
+4. **Synchronization Phase** (RTP)
+   ```
+   iOS → FLUSH command with anchor → All receivers
+
+   FLUSH parameters:
+   - rtpTime: 12345678        // Which RTP packet is anchor
+   - rtpMonoNanos: T+2000000000  // When anchor plays (nanos)
+
+   iOS calculates start times:
+   - Sonos:   audioLatency = 1.0s → Start at T+1.0s
+   - Windows: audioLatency = 1.19s → Start at T+1.19s
+
+   Both should play RTP 12345678 simultaneously
+   ```
+
+5. **Playback Phase**
+   ```
+   iOS → Continuous RTP stream → All receivers
+
+   Without PTP:
+   - Devices use local monotonic clocks
+   - No shared time reference
+   - Drift inevitable over time
+
+   With PTP (hardware):
+   - All devices sync to PTP master clock
+   - Nanosecond precision possible
+   - iOS can coordinate long-term sync
+   ```
+
+### Configuration System
+
+**config.json Schema:**
+```json
+{
+  "device_name": "string",           // mDNS advertised name
+  "multiroom_delay_seconds": number  // [REMOVED - this investigation]
+}
+```
+
+**Loading Process:**
+```python
+# In ap2-receiver.py startup
+config_path = os.path.join(os.path.dirname(__file__), 'config.json')
+if os.path.exists(config_path):
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+        if 'device_name' in config:
+            args.mdns = config['device_name']
+            # Used for mDNS service name
+```
+
+### Diagnostic Tools
+
+**Scripts Created:**
+- `setup-windows.ps1` - Prerequisite checker and setup wizard
+- `env-check.ps1` - Full environment diagnostic report
+- `get-network-guid.ps1` - Windows network interface GUID helper
+- `run-receiver.ps1` - Launch script with proper arguments
+
+**Logging:**
+```python
+# Audio subprocess logging
+self.audio_screen_logger.info(f"[SYNC] FLUSH: Anchor {rtptime}")
+self.audio_screen_logger.info(f"[SYNC] Starting playback")
+self.audio_screen_logger.info(f"[SYNC] Buffer: {buffer_size} packets")
+
+# File logging (audio.debug.log)
+# - Full packet traces
+# - Timing measurements
+# - Buffer state snapshots
+```
+
+### Testing Methodology
+
+**Test Procedure:**
+1. Start Windows receiver: `python ap2-receiver.py -n "{GUID}" -m "Upstairs"`
+2. Edit `config.json` with test delay value
+3. Restart receiver (config loaded on startup)
+4. Open iOS Music app
+5. Select both "Upstairs" and "Sonos" in AirPlay menu
+6. Play audio and observe sync quality
+7. Note lag/lead behavior and start timing
+
+**Metrics Collected:**
+- Start time difference (visual/audio observation)
+- Content alignment (listening to lyrics/beats)
+- Drift over time (1 minute, 5 minute tests)
+- Buffer packet counts (from logs)
+- RTP timestamp progression (from logs)
+
+**Observation Method:**
+- Play music with distinct beats/vocals
+- Listen simultaneously to both outputs
+- Measure delay with ears (±100ms accuracy)
+- Count beats to estimate drift (1 beat ≈ 0.5s @ 120 BPM)
+
+---
+
 ## The Problem
 
 ### Initial Observation
