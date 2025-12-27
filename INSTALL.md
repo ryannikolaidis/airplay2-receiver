@@ -21,7 +21,23 @@ Complete installation guide for running the AirPlay 2 receiver on Windows with m
 
 ---
 
-## Installation Steps
+## Quick Start
+
+For an automated prerequisite check and guided setup:
+
+```powershell
+# Run the setup wizard
+powershell -ExecutionPolicy Bypass -File setup-windows.ps1
+
+# OR for a detailed environment report
+powershell -ExecutionPolicy Bypass -File env-check.ps1
+```
+
+The setup script will check all prerequisites and guide you through any missing dependencies.
+
+---
+
+## Manual Installation Steps
 
 ### 1. Install System Dependencies
 
